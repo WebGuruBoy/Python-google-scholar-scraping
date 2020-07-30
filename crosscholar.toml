@@ -1,0 +1,25 @@
+# The directory must exists
+download_dir = 'C:\Users\mazaj\Documents\Scholar\google-scholar\photos'
+default_photo = 'C:\Users\mazaj\Documents\Scholar\google-scholar\photos\avatar_scholar_56.png'
+
+
+# Speed limits
+# Maximum number of requests sent to Google per second, minute and hour, correspondingly
+limits = [2, 9, 540] # integers greather than 0, default: [2, 9, 540]
+
+### If the following vars are not configured, errors may occur
+# Firefox driver only
+#driver_dir = 'C:\Users\mazaj\OneDrive\Documents\Scholar\google-scholar\phantomjs-2.1.1-windows\bin\phantomjs.exe'
+#driver_dir = 'C:\Users\mazaj\OneDrive\Documents\Scholar\google-scholar\geckodriver.exe'
+driver_dir = 'C:\Users\mazaj\Documents\Scholar\google-scholar\geckodriver.exe'
+
+[crossref]
+enabled = true # default: true (recommended)
+mail_to = 'someone@example.com'
+
+[notify]
+enabled = true # default: false
+mail_from = 'someone@example.com'
+mail_pass = 'passwod'
+mail_host = 'smtp.gmail.com:587'
+mail_to = 'someone@exmample.com'

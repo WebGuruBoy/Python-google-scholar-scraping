@@ -1,0 +1,13 @@
+https://host3.mazajnet.com:2083/
+Domain: al-nashama.com
+UserName: alnashama
+PassWord: tZF~GgmT[&O?
+
+Cheng@Cheng123
+5.9.105.154
+root
+port 22
+
+5.9.105.168:10338
+linant10899
+mazajnet3@gmail.com

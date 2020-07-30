@@ -1,0 +1,1398 @@
+# Python imports
+import sys
+import datetime
+from html import unescape
+from difflib import SequenceMatcher
+from re import search, sub, findall
+from time import strftime
+from csv import reader
+from typing import List, Tuple, Dict, BinaryIO
+from time import sleep
+from math import ceil
+from os.path import basename, exists, getsize
+import traceback
+import smtplib
+import urllib.request as urllib2
+import os
+import json
+
+# Vendor imports
+import requests
+import pymysql
+from habanero import Crossref
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+from selenium.common.exceptions import ElementClickInterceptedException
+from selenium.webdriver.common.proxy import Proxy, ProxyType
+from urllib.parse import quote_plus
+
+# Crosscholar modules imports
+from urlman import URLFactory, ScholarURLType,get_proxy
+from scholarbase import Work, User
+from timer import Requestmeter
+from config import Configuration
+import xlrd
+
+import threading
+import time
+import random
+from base64 import b64encode
+
+
+#global variable
+thread_count = 0
+
+# Configuring app
+config = Configuration('crosscholar.toml')
+options = Options()
+options.add_argument('--headless')
+# region Adaptive Request Rate
+requestmeter = Requestmeter(config.limits)
+pause = False  # This flag will slow down the request speed
+researchId = 1
+connection = pymysql.connect(host='localhost',
+                                user='root',
+                                password='',
+                                db='google_scholar',
+                                charset='utf8mb4',
+                                cursorclass=pymysql.cursors.DictCursor)
+try:
+    cursor = connection.cursor()
+    connection.begin()
+except Exception as e:
+       print("ERROR: ", e)
+
+def s_adaptive_request_rate(compensation_time):
+    global pause
+    pause = True  # Wait 'till compensation time is elapsed
+    print(f".:WAITING: {compensation_time} s:.")
+    sleep(compensation_time)
+    requestmeter.timer.elapsed_seconds += ceil(compensation_time)
+    pause = False  # Continue requesting
+
+
+def m_adaptive_request_rate(compensation_time):
+    global pause
+    print(f".:WAITING: {compensation_time} m:.")
+    compensation_time *= 60
+    pause = True  # Wait 'till compensation time is elapsed
+    sleep(compensation_time)
+    requestmeter.timer.elapsed_minutes += ceil(compensation_time / 60)
+    pause = False  # Continue requesting
+
+
+def h_adaptive_request_rate(compensation_time):
+    global pause
+    print(f".:WAITING: {compensation_time} h:.")
+    compensation_time *= 3600
+    pause = True  # Wait 'till compensation time is elapsed
+    sleep(compensation_time)
+    requestmeter.timer.elapsed_hours += ceil(compensation_time / 3600)
+    pause = False  # Continue requesting
+
+
+# Event subscriptions
+requestmeter.events.s_speed_limit_exceeded = s_adaptive_request_rate
+#requestmeter.events.m_speed_limit_exceeded = m_adaptive_request_rate
+#requestmeter.events.h_speed_limit_exceeded = h_adaptive_request_rate
+
+
+# endregion Adaptive Request Rate
+# Image download
+def file_download(url, file_path, proxy):
+    #rq = urllib2.Request(url)
+
+    #proxy_handler = urllib2.ProxyHandler({'http': 'http://{0}:{1}@{2}'.format(proxy['user'], proxy['passwd'], proxy['url'])
+    #                                        ,'https': 'https://{0}:{1}@{2}'.format(proxy['user'], proxy['passwd'], proxy['url'])})
+    proxy_handler = urllib2.ProxyHandler({'http': 'http://{0}'.format(proxy)
+                                            ,'https': 'https://{0}'.format(proxy)})
+    #auth = urllib2.HTTPBasicAuthHandler()
+    #opener = urllib2.build_opener(proxy_handler, auth, urllib2.HTTPHandler)
+    opener = urllib2.build_opener(proxy_handler)
+    urllib2.install_opener(opener)
+
+    res = urllib2.urlopen(url)
+
+    output = open(file_path, 'wb')
+    output.write(res.read())
+    output.close()
+
+# region Scraper functions
+def gsc_users(soup: BeautifulSoup,userId) -> List[User]:
+    """Parses the Google Scholar citations view.
+
+    This view shows a list of authors(users) related to a keyword search, i.e., if the keyword is "MIT", this page
+    shows a list of authors(users) who are related to the term "MIT".
+
+    The url is something like this:
+    https://scholar.google.com.mx/citations?hl=en&view_op=search_authors&mauthors=<keywords>
+
+    Parameters
+    ----------
+    soup : BeautifulSoup
+        The HTML soup for the citations page (a list of users) related to a term that this function will parse.
+
+    Returns
+    -------
+    list
+        A list with users' (authors) data.
+
+    """
+
+    users = []
+
+    if soup.find('div', id='gsc_sa_ccl'):
+        users_soup = soup.find_all('div', class_='gs_ai gs_scl gs_ai_chpr')
+        for user in users_soup:
+            u = User()
+            u['avatar'] = ScholarURLType.BASE.value + user.find(class_='gs_ai_pho').img['src']
+
+            u['page'] = URLFactory(type_=ScholarURLType.CITATIONS_USER,
+                                   url=ScholarURLType.BASE.value +
+                                       user.find(class_='gs_ai_t').h3.a['href'])
+            print(u['page'].first_url())
+            u['id'] = userId
+            print(userId)
+            userId += 1
+            try:
+                u['name'] = user.find(class_='gs_ai_t').h3.a.string.title()
+                print(u['name'])
+            except AttributeError:
+                try:
+                    markup = user.find(class_='gsc_oai_name')
+                    name_tag = None
+
+                    while markup.a.find(class_='gs_hlt') is not None:
+                        name_tag = markup.a
+                        name_tag.span.unwrap()
+                    u['name'] = name_tag.get_text()
+                except:
+                    u['name'] = ''
+            try:
+              u['position'] = user.find('div',class_='gs_ai_aff').string
+              if u['position'] == None:
+                  u['position'] = ''
+            except TypeError:
+              u['position'] = ''
+
+            try:
+              email_text = user.find('div', class_='gs_ai_eml').text.strip()
+              u['email'] = email_text.replace('Verified email at ', '')
+
+              print("debug:u['email'] = {0}".format(u['email']))
+              if u['email'] == None:
+                  u['email'] = ''
+            except:
+              u['email'] = ''
+
+
+            try:
+               u['category'] = ''
+               for cat in user.find_all(class_='gs_ai_one_int'):
+                  u['category'] = u['category'] + cat.string + ','
+
+            except TypeError:
+              u['category'] = ''
+
+            print(u['position'])
+            print(u['email'])
+            print(u['category'])
+            try:
+                # Searching just fot the number in this string to get citations count
+                u['citations_count'] = int(findall(r"\d+", user.find(class_='gs_ai_cby').string)[0])
+            except TypeError:
+                u['citations_count'] = 0
+            print(u['citations_count'])
+
+            users.append(u)
+
+        return users
+
+
+def gsc_user_citations_graph(soup: BeautifulSoup, user: User) -> None:
+    """Parses the Google Scholar user citations graph.
+
+    This view shows a list of the documents of a specific author (user) and the citations graph
+    for that user.
+
+    The url is something like this:
+    https://scholar.google.com.mx/citations?hl=en&user=<id>
+
+    Parameters
+    ----------
+    soup : BeautifulSoup
+        The HTML soup for the user citations where is the graph that this function will parse.
+
+    user : User
+        The user for whom we want to obtain the graph.
+
+    """
+
+    citations_per_year = {}
+
+    if soup.find('div', class_='gsc_md_hist_b'):
+        years = soup.find_all('span', class_='gsc_g_t')
+        counts = soup.find_all('a', class_='gsc_g_a')
+
+        for (year, count) in zip(years, counts):
+            citations_per_year[year.string] = count.span.string
+
+        user.__setitem__('citations_per_year', citations_per_year)
+
+
+def gsc_work_citations_graph(soup: BeautifulSoup) -> Dict:
+    """Parses the Google Scholar user citations graph.
+
+    This view shows a list of the documents of a specific author (user) and the citations graph
+    for that user.
+
+    The url is something like this:
+    https://scholar.google.com.mx/citations?hl=en&user=<id>
+
+    Parameters
+    ----------
+    soup : BeautifulSoup
+        The HTML soup for the user citations where is the graph that this function will parse.
+
+    """
+
+    citations_per_year = {}
+
+    if soup.find('div', id='gsc_vcd_graph_bars'):
+        years = soup.find_all('span', class_='gsc_vcd_g_t')
+        counts = soup.find_all('a', class_='gsc_vcd_g_a')
+
+        for (year, count) in zip(years, counts):
+            citations_per_year[year.string] = count.span.string
+
+        return citations_per_year
+
+def gsc_user_detail_works(soup: BeautifulSoup, user: User,research_rec) -> int:
+    """Parses the Google Scholar citations per user page.
+
+    This view shows a list of the documents of a specific author (user) and the citations graph
+    for that user.
+
+    The url is something like this:
+    https://scholar.google.com.mx/citations?hl=en&user=<id>
+
+    Parameters
+    ----------
+    soup : BeautifulSoup
+        The HTML soup for the citations/user page (documents) for a particular user (author) that this function will
+        parse.
+
+    user : User
+        The user related to these documents.
+
+    file : object
+        The file object where the program will write the results.
+
+    browser : webdriver
+        The browser that is used to extract the works.
+
+    start_in_work : int
+        When batch processing is used, this parameter indicates in which work start to parse.
+
+    Returns
+    -------
+    int
+        Total documents parsed.
+
+    """
+
+    #print( user['citations_all'])
+    if soup.find('tbody', id='gsc_a_b'):
+        works_soup = soup.find_all('tr', class_='gsc_a_tr')
+
+
+        researc_counter = 0
+        #research_rec = 1
+        print(len(works_soup))
+        for work in works_soup:
+
+            # Batch processing: Start to parse in the work (position) specified
+            #if start_in_work is not None and record < start_in_work:
+                #record += 1
+                #continue
+
+            """
+            w = Work()
+            w['user_name'] = user['name']
+            w['gsc_title'] = sub(r"\s", ' ', sub(r"\s+", ' ', work.find(class_='gsc_a_t').a.text)).strip()
+
+            href = quote_plus(work.find(class_='gsc_a_t').a['data-href'].replace("&pagesize=100", ""))
+            w['url'] = f"{user['page'].url}#d=gs_md_cita-d&p=&u={href}%26tzom%3D360"
+
+            extra_data = work.find_all(class_="gs_gray")
+            w['authors'] = extra_data[0].string
+
+            try:
+                w['citations_count'] = int(work.find(class_='gsc_a_c').a.string)
+            except Exception:
+                w['citations_count'] = 0
+
+            try:
+                citations_url = (work.find(class_='gsc_a_c').a['href']).strip()
+                w['citations_url'] = citations_url if citations_url else None
+            except Exception:
+                w['citations_url'] = None
+
+            try:
+                w['id'] = search(r"cites=(.*)$", w['citations_url']).group(1)
+            except Exception:
+                w['id'] = None
+
+            try:
+                # TODO: Check if this condition works
+                w['gsc_publication'] = extra_data[1].text if not extra_data[1].text else None
+            except Exception:
+                w['gsc_publication'] = None
+
+            try:
+                w['year'] = work.find(class_='gsc_a_y').span.string
+            except Exception:
+                w['year'] = None
+            #gsc_work_details(work_details_request(browser, w['gsc_title']), w)
+
+            #if config.crossref:
+                #crf_work_details(w, user)
+            print(int(research_rec))
+            print(user["id"])
+            print(w['user_name'])
+            print(w['gsc_title'])
+            print(w['url'])
+            print( w['authors'])
+            print( w['citations_count'])
+            print(w['citations_url'])
+            print(w['id'])
+            print(w['gsc_publication'])
+            print(w['year'])
+            #gsc_work_wos_citations(browser, w)
+
+            # Printing and saving to file
+            #print(f"In work: {record} >>> {w.as_csv()}\n")
+            #file.write((w.as_csv() + "\n").encode())
+            if w['year']!=None:
+                sql = "INSERT INTO research (research_id, acadmic_id,acadmic_name,cited_by,research_year) VALUES (%s,%s,%s,%s,%s)"
+                val = (int(research_rec),int(user["id"]),str(w['gsc_title']),int(w['citations_count']),int(w['year']))
+            else:
+                sql = "INSERT INTO research (research_id, acadmic_id,acadmic_name,cited_by) VALUES (%s,%s,%s,%s)"
+                val = (int(research_rec), int(user["id"]), str(w['gsc_title']), int(w['citations_count']))
+            cursor.execute(sql, val)
+            connection.commit()
+            """
+            researc_counter += 1
+            research_rec += 1
+        user['researc_n'] = researc_counter
+        return research_rec
+
+
+def gsc_user_works(soup: BeautifulSoup, user: User, file: BinaryIO, browser: webdriver = None,
+                   start_in_work: int = None) -> int:
+    """Parses the Google Scholar citations per user page.
+
+    This view shows a list of the documents of a specific author (user) and the citations graph
+    for that user.
+
+    The url is something like this:
+    https://scholar.google.com.mx/citations?hl=en&user=<id>
+
+    Parameters
+    ----------
+    soup : BeautifulSoup
+        The HTML soup for the citations/user page (documents) for a particular user (author) that this function will
+        parse.
+
+    user : User
+        The user related to these documents.
+
+    file : object
+        The file object where the program will write the results.
+
+    browser : webdriver
+        The browser that is used to extract the works.
+
+    start_in_work : int
+        When batch processing is used, this parameter indicates in which work start to parse.
+
+    Returns
+    -------
+    int
+        Total documents parsed.
+
+    """
+
+    if soup.find('tbody', id='gsc_a_b'):
+        works_soup = soup.find_all('tr', class_='gsc_a_tr')
+        counter = 1
+        record = 1
+        for work in works_soup:
+
+            # Batch processing: Start to parse in the work (position) specified
+            if start_in_work is not None and record < start_in_work:
+                record += 1
+                continue
+
+            w = Work()
+            w['user_id'] = user['id']
+            w['gsc_title'] = sub(r"\s", ' ', sub(r"\s+", ' ', work.find(class_='gsc_a_t').a.text)).strip()
+
+            href = quote_plus(work.find(class_='gsc_a_t').a['data-href'].replace("&pagesize=100", ""))
+            w['url'] = f"{user['page'].url}#d=gs_md_cita-d&p=&u={href}%26tzom%3D360"
+
+            extra_data = work.find_all(class_="gs_gray")
+            w['authors'] = extra_data[0].string
+
+            try:
+                w['citations_count'] = int(work.find(class_='gsc_a_c').a.string)
+            except Exception:
+                w['citations_count'] = 0
+
+            try:
+                citations_url = (work.find(class_='gsc_a_c').a['href']).strip()
+                w['citations_url'] = citations_url if citations_url else None
+            except Exception:
+                w['citations_url'] = None
+
+            try:
+                w['id'] = search(r"cites=(.*)$", w['citations_url']).group(1)
+            except Exception:
+                w['id'] = None
+
+            try:
+                # TODO: Check if this condition works
+                w['gsc_publication'] = extra_data[1].text if not extra_data[1].text else None
+            except Exception:
+                w['gsc_publication'] = None
+
+            try:
+                w['year'] = work.find(class_='gsc_a_y').span.string
+            except Exception:
+                w['year'] = None
+            gsc_work_details(work_details_request(browser, w['gsc_title']), w)
+
+            if config.crossref:
+                crf_work_details(w, user)
+
+            gsc_work_wos_citations(browser, w)
+
+            # Printing and saving to file
+            print(f"In work: {record} >>> {w.as_csv()}\n")
+            file.write((w.as_csv() + "\n").encode())
+            counter += 1
+            record += 1
+
+        return counter
+
+
+def gsc_work_wos_citations(browser: webdriver, work: Work) -> None:
+    soup = work_wos_citations_request(browser, work['gsc_title'])  # send request and get the page source
+
+    if soup.find('div', id='gs_res_ccl_mid') and soup.find('div', class_='gs_r gs_or gs_scl'):
+        results = soup.find_all('div', class_='gs_r gs_or gs_scl')
+
+        for result in results:
+            h3 = result.find('h3', class_="gs_rt")
+
+            if h3.find("a"):
+                h3 = h3.a
+
+            search_title = sub(r"\s", ' ', sub(r"\s+", ' ', h3.text))
+            search_title = sub(r"\[.*\]", '', search_title).strip().lower()
+            profile_title = work['gsc_title'].lower()
+
+            if search_title is not None and SequenceMatcher(None, profile_title, search_title).ratio() >= 0.9:
+                wos = result.find('a', class_='gs_nta gs_nph')
+                work['wos_citations_count'] = wos.string.replace('Web of Science:', '').strip() if wos is not None else wos
+                work['wos_citations_url'] = wos['href'] if wos is not None else wos
+                print("WOS: ", work['wos_citations_count'], sep=" ")
+                break
+            else:
+                logging_collector("INFO", "TITLE MISMATCH",
+                                  [profile_title,  # Title in profile
+                                   search_title,  # Title in search
+                                   SequenceMatcher(None, profile_title, search_title).ratio()])  # Coincidence
+
+    sleep(0.5)
+    browser.close()  # close the tab
+    sleep(0.5)
+    browser.switch_to.window(browser.window_handles[0])  # return to the main tab
+
+
+def crf_work_details(work: Work, user: User) -> None:
+    """Completes the data of a document using crossref API.
+
+    We do this to make less requests to Google Scholar and to get the DOI.
+
+    Parameters
+    ----------
+    work : Work
+        The work to get the data.
+
+    user : User
+        The user (author) of de document.
+
+    """
+    print(">>> Entering crf")
+    print("Title:", work['gsc_title'])
+
+    # Init habanero object
+    crossref = Crossref(mailto=config.crossref_to)
+    d = crossref.works(query_title=work['gsc_title'])
+
+    try:
+        items = d['message']['items']
+
+        # Removing all unnecessary characters to make a title comparision
+        regex = r"[^0-9a-zA-ZáàâäéèêëíìîïóòôöúùûüñçÿæœßÁÀÂÄÉÈËÊÍÎÌÏÓÒÔÖÚÙÛÜÑÇŸÆŒẞ]"
+        gsc_title = sub(regex, '', unescape(work['gsc_title'].lower()))
+
+        match_ratio = 1
+
+        # Search first for a perfect match: this is a loop
+        details = next((item for item in items if
+                        sub(regex, '', unescape(item['title'][0].lower())) ==
+                        gsc_title), None)
+
+        # If there isn't a perfect match, search for an approximation
+        if details is None:
+            found = [False, False]
+
+            for item in items:
+
+                crf_title = sub(regex, '', unescape(item['title'][0].lower()))
+                crf_title = sub(r"\s", ' ', sub(r"\s+", ' ', crf_title)).strip()
+                match_ratio = SequenceMatcher(None, crf_title, gsc_title).ratio()
+
+                if match_ratio >= 0.75:
+                    details = item
+                    found[0] = True
+
+                    authors = details['author'] if 'author' in details else []
+                    gsc_name = user['name'].lower()
+
+                    for author in authors:
+
+                        if {'given', 'family'} <= set(author):
+                            crf_name = f"{author['given']} {author['family']}".lower()
+                        elif 'given' in author:
+                            crf_name = f"{author['given']}".lower()
+                        elif 'family' in author:
+                            crf_name = f"{author['family']}".lower()
+                        else:
+                            continue
+
+                        name_ratio = SequenceMatcher(None, crf_name, gsc_name).ratio()
+
+                        if name_ratio >= 0.69:
+                            found[1] = True
+                            break
+                    break
+
+            if not (found[0] and found[1]):
+                print("<<< Leaving crf")
+                return
+
+    except IndexError:
+        print("<<< Leaving crf")
+        return
+
+    work['match_ratio'] = match_ratio
+
+    if work['match_ratio'] < 1:
+        # Removing any extra unnecessary blanks and replacing any blank for a single space
+        work['crf_title'] = sub(r"\s", ' ', sub(r"\s+", ' ', details['title'][0]))
+
+    if work['volume'] is None:
+        if 'volume' in details:
+            work['volume'] = details['volume']
+
+    if work['issue'] is None:
+        if 'issue' in details:
+            work['issue'] = details['issue']
+
+    if work['pages'] is None:
+        if 'page' in details:
+            work['pages'] = details['page']
+
+    if 'DOI' in details:
+        work['doi'] = details['DOI']
+
+    if 'container-title' in details:
+        # Removing any extra unnecessary blanks and replacing any blank for a single space
+        work['crf_publication'] = sub(r"\s", ' ', sub(r"\s+", ' ', details['container-title'][0]))
+
+    if 'type' in details:
+        work['crf_type'] = details['type']
+
+    print("<<< Leaving crf")
+
+
+def gsc_work_details(soup: BeautifulSoup, work: Work) -> None:
+    """Gets a document details from Google Scholar ajax modal.
+
+    Parameters
+    ----------
+    soup : BeautifulSoup
+        The HTML soup for the details modal for a particular work that this function will
+        parse.
+
+    work : Work
+        The url of the work from which we want to get the details.
+
+    """
+
+    if soup is None:
+        return
+
+    details = dict()
+
+    if soup.find('div', id='gsc_vcd_table'):
+        details_soup = soup.find_all('div', class_='gs_scl')
+
+        for detail in details_soup:
+            try:
+                field = detail.find(class_='gsc_vcd_field').string
+                if field in {'Publication date', 'Publisher', 'Description', 'Scholar articles'}:
+                    continue
+
+                details[field] = detail.find(class_='gsc_vcd_value').string if field != 'Total citations' else \
+                    detail.find(class_='gsc_vcd_value')
+
+            except AttributeError:
+                pass
+
+        # If a detail is the dictionary of details, add it to the work, and then remove the detail from the dict
+        work['authors'] = details['Authors'] if 'Authors' in details else None
+        details.pop('Authors', None)
+
+        patent = False
+        if 'Inventors' in details:
+            work['authors'] = details['Inventors']
+            patent = True
+            details.pop('Inventors', None)
+
+        work['pages'] = details['Pages'] if 'Pages' in details else None
+        details.pop('Pages', None)
+
+        work['volume'] = details['Volume'] if 'Volume' in details else None
+        details.pop('Volume', None)
+
+        work['issue'] = details['Issue'] if 'Issue' in details else None
+        details.pop('Issue', None)
+
+        if 'Total citations' in details:
+            work['citations_per_year'] = gsc_work_citations_graph(details['Total citations'])
+        details.pop('Total citations', None)
+
+        # At this point, if the dict still has an element, this must be the work type with the publication title,
+        # so get them. This way we don't restrict the types to a set of "predefined types", we take any string
+        # that Google provides as type.
+        if patent:
+            work['gsc_type'] = 'Patent'  # This string represents the work type
+            work['gsc_publication'] = None  # This one represents the publication title
+        elif details.items():
+            work['gsc_type'] = list(details.items())[0][0]  # This string represents the work type
+            work['gsc_publication'] = list(details.items())[0][1]  # This one represents the publication title
+
+
+# endregion
+
+# region Request functions
+def wait():
+    sleep(20)
+    while pause:
+        continue
+
+
+def beautifulsoup_request(target: str) -> BeautifulSoup:
+    wait()  # Waiting for the adaptive request rate
+    r = requests.get(target)  # requests.get(url)
+    requestmeter.count()
+    html_ = r.content
+    return BeautifulSoup(html_, 'html.parser')
+
+
+def display_user_page_request(browser: webdriver, target: str) -> None:
+    wait()  # Waiting for the adaptive request rate
+    browser.get(target)
+    browser.set_window_position(-3000,0)
+    requestmeter.count()
+    #print(requestmeter.count())
+
+def display_all_user_works_requests(browser: webdriver) -> None:
+    #print(browser.find_element_by_id('gsc_bpf_more'))
+    is_enable = browser.find_element_by_id('gsc_bpf_more').is_enabled()
+
+    while is_enable:
+        wait()  # Waiting for the adaptive request rate
+        browser.find_element_by_id('gsc_bpf_more').click()
+        requestmeter.count()
+        sleep(1)
+        is_enable = browser.find_element_by_id('gsc_bpf_more').is_enabled()
+
+
+
+
+
+
+def work_details_request(browser: webdriver, title: str) -> BeautifulSoup:
+    wait()
+    try:
+        work = browser.find_element_by_link_text(title)
+
+        # Waiting 'till link is clickable
+        while True:
+            try:
+                work.click()
+                break
+            except ElementClickInterceptedException:
+                continue
+
+        requestmeter.count()
+        sleep(0.5)  # This delay permits the html display entirely
+        html_ = browser.page_source
+        close_button = browser.find_element_by_id('gs_md_cita-d-x')
+        close_button.click()
+    except Exception as err:
+        print("!!!>>>", title)
+        print(err)
+
+        logging_collector("ERROR", "NOT CLICKABLE LNK",
+                          [browser.find_element_by_id('gsc_prf_in').text,  # Author
+                           title,  # Title
+                           err])  # Error
+        return None
+
+    return BeautifulSoup(html_, 'html.parser')
+
+
+def work_wos_citations_request(browser: webdriver, title: str):
+    url = ScholarURLType.BASE.value + ScholarURLType.SEARCH.value.replace('<title>', title).replace('"', '\\"')
+
+    wait()
+    browser.execute_script(f"""window.open("{url}","_blank");""")  # request
+    WebDriverWait(browser, 10).until(EC.number_of_windows_to_be(2))
+    requestmeter.count()
+
+    browser.switch_to.window(browser.window_handles[1])  # changes to the new tab
+    WebDriverWait(browser, 10).until(EC.presence_of_element_located((By.NAME, 'q')))
+    search_box = browser.find_element_by_name('q')  # gets the search box
+    search_box.send_keys(title)  # puts the query
+    search_box.submit()  # send the request
+
+    WebDriverWait(browser, 10).until(EC.presence_of_element_located((By.NAME, 'q')))
+
+    return BeautifulSoup(browser.page_source, 'html.parser')
+
+
+# endregion Request functions
+
+def download_users(keywords: str,uni_id,n, p_dir, proxy) -> Tuple[str, int]:
+    """Downloads a list of users based on some keywords sent to Google Scholar.
+
+    Parameters
+    ----------
+    keywords : str
+        Search criteria send to Google Scholar.
+
+    Returns
+    -------
+    str
+        The name of the file where the results were saved.
+
+    int
+        The number of users in the batch.
+
+    """
+
+    global thread_count
+
+    # mysql connection
+    connection = pymysql.connect(host='localhost',
+                                 user='root',
+                                 password='',
+                                 db='google_scholar',
+                                 charset='utf8mb4',
+                                 cursorclass=pymysql.cursors.DictCursor)
+
+    try:
+        cursor = connection.cursor()
+        connection.begin()
+    except Exception as e:
+        print("ERROR: ", e)
+
+    # decide exist page info
+    # Check to see if already done for university.
+    cursor.execute("select * from universities"
+                   "  where uni_id = %s",
+                   (uni_id, ))
+    rows = cursor.fetchall()
+    rest = 0
+    offset = 0
+    next_url = ""
+    if not rows or len(rows) == 0:
+        # Check exist page number
+        cursor.execute("select MAX(academic_id) as max_id from academic"
+                   "  where uni_id = %s",
+                   (uni_id, ))
+        row = cursor.fetchone()
+        if row and row.get('max_id'):
+            max_id = row.get('max_id')
+            n = int(max_id / 10)
+            rest = max_id % 10
+            offset = n * 10
+            if rest > 0:
+                # delete rest academic_id
+                _from = max_id - rest + 1
+                _to = max_id
+                cursor.execute("delete from academic"
+                               " where uni_id=%s and academic_id >= %s and academic_id <= %s",
+                               (uni_id, _from, _to))
+                connection.commit()
+
+            # get next url from table
+            cursor.execute("select next_url from academic"
+                           "  where uni_id = %s and academic_id = "
+                           "(select MAX(academic_id) from academic where uni_id=%s)",
+                           (uni_id, uni_id))
+            row = cursor.fetchone()
+            if row and row.get('next_url'):
+                next_url = row.get('next_url')
+                print("next_url === {0}".format(next_url))
+    else:
+    	thread_count -= 1
+    	connection.close()
+    	return 0
+
+
+    print("n = {0}, rest = {1}, uni_id={2}, keyword={3}".format(n, rest, uni_id, keywords))
+    # Page counter
+
+    # service_args = [
+    #     '--ignore-ssl-errors=true',
+    #     '--ssl-protocol=any',
+    #     '--proxy=http://{0}'.format(proxy['url']),
+    #     '--proxy-auth={0}:{1}'.format(proxy['user'], proxy['passwd']),
+    #     '--proxy-type=http',
+    # ]
+
+    #browser = webdriver.PhantomJS(executable_path=config.driver, service_args=service_args)
+
+    # profile = webdriver.FirefoxProfile()
+    # profile.set_preference("network.proxy.type", 1)
+    # profile.set_preference("network.proxy.http", proxy['url'].split(':')[0])
+    # profile.set_preference("network.proxy.http_port", 80)
+    # profile.set_preference("network.proxy.ssl", proxy['url'].split(':')[0])
+    # profile.set_preference("network.proxy.ssl_port", 80)
+    # profile.set_preference('network.proxy.no_proxies_on', 'localhost, 127.0.0.1')
+    #
+    # credentials = '{0}:{1}'.format(proxy['user'], proxy['passwd'])
+    # credentials = b64encode(credentials.encode('ascii')).decode('utf-8')
+    # profile.set_preference('extensions.closeproxyauth.authtoken', credentials)
+
+    myProxy_url = proxy.split(':')[0]
+    myProxy_port = proxy.split(':')[1]
+
+    #myProxy = "{}:{}@{}".format(proxy['user'], proxy['passwd'], myProxy)
+
+    print("myProxy_url=={0}, port={1}\n".format(myProxy_url, myProxy_port))
+
+    print("======== uni_id={0}, thread_count={1} ========\n".format(uni_id, thread_count))
+    # firefox_proxy = Proxy({
+    #     'proxyType': ProxyType.MANUAL,
+    #     'httpProxy': proxy['url'],
+    #     'ftpProxy': proxy['url'],
+    #     'sslProxy': proxy['url'],
+    #     'noProxy': '',  # set this value as desired
+    #     "socksUsername" : proxy['user'],
+    #     "socksPassword" : proxy['passwd'],
+    # })
+
+    #webdriver.DesiredCapabilities.FIREFOX['proxy'] = firefox_proxy
+    # capabilities = webdriver.DesiredCapabilities.firefox();
+    # capabilities.setCapability("firefox_profile", firefox_proxy);
+    browser = None
+    try:
+
+	    profile = webdriver.FirefoxProfile()
+	    profile.set_preference("network.proxy.type", 1)
+	    profile.set_preference("network.proxy.http", myProxy_url)
+	    profile.set_preference("network.proxy.ssl", myProxy_url)
+	    profile.set_preference("network.proxy.ftp", myProxy_url)
+	    profile.set_preference("network.proxy.http_port", int(myProxy_port))
+	    profile.set_preference("network.proxy.ssl_port", int(myProxy_port))
+	    # profile.set_preference("network.proxy.socks_username", proxy['user'])
+	    # profile.set_preference("network.proxy.socks_password", proxy['passwd'])
+
+	    # profile.set_preference('signon.autologin.proxy', 'true')
+	    # profile.set_preference('network.proxy.share_proxy_settings', 'false')
+	    # profile.set_preference('network.automatic-ntlm-auth.allow-proxies', 'false')
+	    # profile.set_preference('network.auth.use-sspi', 'false')
+
+	    # proxy_dict = {'proxyType': ProxyType.MANUAL,
+	    #               'httpProxy': proxy['url'],
+	    #               'ftpProxy': proxy['url'],
+	    #               'sslProxy': proxy['url'],
+	    #               'noProxy': '',
+	    #               'socksUsername': proxy['user'],
+	    #               'socksPassword': proxy['passwd']}
+
+	    # proxy_config = Proxy(proxy_dict)
+	    # profile.update_preferences()
+
+	    options = Options()
+	    options.headless = True
+
+	    browser = webdriver.Firefox(executable_path=config.driver, options=options
+	                                , firefox_profile=profile)#, proxy=firefox_proxy)
+
+	    # proxy check
+	    # url = 'https://httpbin.org/ip'
+	    # #response = requests.get(url, proxies={"http": "{0}:{1}@{2}".format(proxy['user'], proxy['passwd'], proxy['url'])}, verify=False, timeout=4)
+	    # #proxy_handler = urllib2.ProxyHandler({'http': 'http://{0}:{1}@{2}'.format(proxy['user'], proxy['passwd'], proxy['url'])
+	    # #                                      ,'https': 'https://{0}:{1}@{2}'.format(proxy['user'], proxy['passwd'], proxy['url'])})
+	    #
+	    # proxy_handler = urllib2.ProxyHandler({'http': 'http://{0}'.format(proxy)
+	    #                                       ,'https': 'https://{0}'.format(proxy)})
+	    #
+	    # #auth = urllib2.HTTPBasicAuthHandler()
+	    # opener = urllib2.build_opener(proxy_handler)
+	    # urllib2.install_opener(opener)
+	    #
+	    # res = urllib2.urlopen(url)
+	    # data = json.load(res)
+	    # print(data)
+
+
+	    # browser.get('https://scholar.google.com')
+	    # wait(browser, 5).until(EC.alert_is_present())
+	    # alert = browser.switch_to_alert()
+	    # alert.send_keys(proxy['user'])
+	    # alert.send_keys(Keys.TAB)
+	    # alert.send_keys(proxy['passwd'])
+	    # alert.accept()
+
+	    #browser.set_window_position(-3000, 0)
+
+	    paramList = []
+	    # Page where is the list of authors
+	    citations_page = URLFactory(ScholarURLType.CITATIONS, keywords)
+	    #print(citations_page.generate())
+	    #print(citations_page.generate())
+	    # HTML of the list of authors
+	    display_user_page_request(browser, citations_page.generate())
+
+	    #login(browser, proxy['user'], proxy['passwd'])
+
+	    users_soup = BeautifulSoup(browser.page_source, 'html.parser')
+
+	    userId = 1
+
+
+	    # for i in range(n):
+	    #     print("i={0}".format(i))
+	    #     display_user_page_request(browser, citations_page.next_url(users_soup))
+	    #     users_soup = BeautifulSoup(browser.page_source, 'html.parser')
+	    #     userId += 10
+	    
+	    if next_url and n > 1:
+	        display_user_page_request(browser, next_url)
+	        users_soup = BeautifulSoup(browser.page_source, 'html.parser')
+    except:
+        if connection:
+            connection.close()
+        if browser:
+            browser.close()
+        thread_count -= 1
+        return 0
+
+    userId += n * 10
+    page = n
+    # All the authors
+    users_list = []
+    no_citations = 0
+
+    while True:
+
+        print(f"--- PAGE {page} ---")
+        print("debug:current time === {0}".format(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        users = gsc_users(users_soup, userId)
+
+        if not users:
+            #userId = 0
+            print("network error = users none.")
+            break
+        users_list.extend(users)
+        if len(users_list) == 0:
+            print("%s didn't match  any user profiles" % keywords)
+            break
+
+        for user in users:
+            #print(user.as_csv() + "\n")
+
+
+            # citations_user_page = user['page']
+            # #works_soup = beautifulsoup_request(citations_user_page.url)
+            # display_user_page_request(browser, citations_user_page.first_url())
+            # works_soup = BeautifulSoup(browser.page_source, 'html.parser')
+            # #str = works_soup.find('div',id="gsc_lwp").text
+            # #str = str.split("Show")[0]
+            # #str = str.split("Articles")[1]
+            # #print(str[3:])
+            # #recearch_count = int(str[3:])
+            # #print(recearch_count)
+            # #user['researc_n'] = recearch_count
+            # try:
+            #     citations_years = works_soup.find_all('td', class_='gsc_rsb_std')
+            #     # print(citations_years)
+            #
+            #     user['citations_all'] = citations_years[0].text
+            #     user['citations_fiveyear'] = citations_years[1].text
+            #     user['hindex_all'] = citations_years[2].text
+            #     user['hindex_fiveyear'] = citations_years[3].text
+            #     user['i10index_all'] = citations_years[4].text
+            #     user['i10index_fiveyear'] = citations_years[5].text
+            # except:
+            #     user['citations_all'] = 0
+            #     user['citations_fiveyear'] = 0
+            #     user['hindex_all'] = 0
+            #     user['hindex_fiveyear'] = 0
+            #     user['i10index_all'] = 0
+            #     user['i10index_fiveyear'] = 0
+            #     print("Citation info doesn;t exist")
+            #
+            # # endregion
+            # #
+            #
+            # #researchId = gsc_user_detail_works(works_soup, user,researchId)
+            user_google_url =  user['page'].first_url()
+
+            # download photo
+            if user['avatar'].find('avatar_scholar_56.png') == -1:
+                photo_path = "{0}\\{1}\\{2}_{3}.png".format(config.download_dir, p_dir, uni_id, user['id'])
+                check_path = os.path.dirname(photo_path)
+                if not os.path.exists(check_path):
+                    os.makedirs(check_path)
+
+                file_download(user['avatar'], photo_path, proxy)
+            else:
+                photo_path = config.default_photo
+
+            next_url = citations_page.next_url(users_soup)
+
+            sql = "INSERT INTO academic (academic_id, uni_id,academic_name" \
+                  ",position, email , category , n_citations " \
+                  ",academic_photo,acad_url, next_url) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s, %s)"
+            val = (user['id'],uni_id, user['name'],user['position']
+                   , user['email'], user['category'], user['citations_count']
+                   , photo_path, user_google_url, next_url)
+            cursor.execute(sql, val)
+            connection.commit()
+            no_citations += user['citations_count']
+
+            userId += 1
+        try:
+            if users_soup.find('button', attrs={'aria-label': 'Next'}) is None or \
+                    users_soup.find('button', attrs={'aria-label': 'Next'}).has_attr('onclick') is not True:
+                break
+            offset += 10
+            display_user_page_request(browser, citations_page.next_url(users_soup))
+            users_soup = BeautifulSoup(browser.page_source, 'html.parser')
+        except:
+            break
+        page += 1
+    paramList.append(userId)
+
+    #if userId > 0:
+    sql = "select count(uni_id) as no_academics, sum(n_citations) as no_citations from academic where uni_id=%s"
+    val = (uni_id,)
+    cursor.execute(sql, val)
+
+    row = cursor.fetchone()
+
+    no_academics = 0
+    no_citations = 0
+
+    if row and row.get('no_academics') and row.get('no_citations'):
+        no_academics = row.get('no_academics')
+        no_citations = row.get('no_citations')
+
+    sql = "INSERT INTO universities (uni_id,uni_name, no_academics, no_citations,uni_google_url) VALUES (%s,%s,%s, %s, %s)"
+    val = (uni_id, uni_name, no_academics, no_citations, uni_url)
+    cursor.execute(sql, val)
+    connection.commit()
+
+    # mysql connection close
+    connection.close()
+    browser.close()
+
+    thread_count -= 1
+    return paramList
+
+
+def download_works(users_batch_path: str, *slices, start_in_user: int = None, start_in_work: int = None) -> None:
+    """Downloads works from Google Scholar for specific users.
+
+    Downloads the works of the users indicated from the `start` to the `stop` positions in the `user_batch_file.
+
+    Parameters
+    ----------
+    slices : object
+    users_batch_path : str
+        The URI to the `user_batch_file` generated by the `download_users` function.
+
+    start_in_work : int
+        Start processing in this specified line (user).
+
+    start_in_user : int
+        Propagate this value to start processing in this specified work.
+
+    See Also
+    --------
+    download_users :  Downloads a list of users from Google Scholar.
+
+    """
+    # Configuring batch processing
+    users = slice_users(users_batch_path, slices, start_in_user)
+
+    # region Configuring batch file name
+    # Converting tuple to suffix for name the file
+    if not slices:
+        suffix = "full"
+    else:
+        suffix = str(slices).replace(' ', '').replace('(', '', 1)
+        suffix = suffix[:suffix.rfind(')')]
+        suffix = suffix[:suffix.rfind(',')]
+
+    parts = basename(users_batch_path).replace('.csv', '').split('_')
+    batch_name = config.download_dir + f"works_batch_{parts[2]}_{parts[3]}_{suffix}.csv"
+    append = True if exists(batch_name) else False
+    # endregion
+
+    with open(batch_name, 'ab') as works_batch_file:
+        # If the file doesn't exist before or is empty, write the header
+        if not append or not (getsize(batch_name) > 0):
+            works_batch_file.write((Work().keys() + "\n").encode())
+
+        total_works = 0
+        for user in users:
+            print(f"********** {user['name']} **********")
+            # region Open Selenium browser
+            browser = webdriver.Firefox(executable_path=config.driver)
+            #browser.maximize_window()
+            browser.set_window_position(-3000, 0)
+            # get user main page
+            display_user_page_request(browser, user['page'].first_url())
+
+            # list all works in the user main page
+            display_all_user_works_requests(browser)
+            # endregion
+
+            works_soup = BeautifulSoup(browser.page_source, 'html.parser')
+            total_works += gsc_user_works(works_soup, user, works_batch_file, browser, start_in_work)
+
+            # The start_in_work applies just for the first user
+            if start_in_work is not None:
+                start_in_work = None
+
+            browser.close()
+
+    print("Total works: ", total_works)
+
+
+def slice_users(users_batch_path: str, slices: Tuple, start_in_user: int) -> Tuple:
+    users = []
+    with open(users_batch_path, 'r', encoding='utf8') as file:
+        records = len(file.readlines())
+        file.seek(0)
+
+        indexes = sliced_indexes(slices, records)
+
+        if start_in_user is not None and start_in_user in indexes:
+            indexes = indexes[indexes.index(start_in_user):]
+
+        r = reader(file, delimiter='|')
+        for index, row in enumerate(r):
+            if index in indexes:
+                users.append(User(row[0], row[1], URLFactory(type_=ScholarURLType.CITATIONS_USER, url=row[2]), row[3],
+                                  row[4], row[5]))
+            elif index > indexes[-1]:
+                break
+
+    return tuple(users)
+
+
+def sliced_indexes(slices: Tuple, records: int) -> Tuple:
+    # Initially it's a set to avoid duplicates
+    indexes = set()
+    if slices:  # If there are elements in the tuple
+        for slice_ in slices:
+            if type(slice_) is tuple and len(slice_) == 2:  # A tuple of two integers: (1,2)
+                if type(slice_[0]) is int and type(slice_[1]) is int and slice_[0] < slice_[1]:
+                    from_ = 1 if slice_[0] <= 0 else slice_[0]
+                    to = slice_[1] + 1
+                    indexes.update(list(range(from_, to)))
+                elif type(slice_[0]) is int and type(slice_[1]) is str and slice_[1] == 'inf':
+                    from_ = slice_[0]
+                    indexes.update(list(range(from_, records)))
+            elif type(slice_) is int:  # A single integer: 5
+                indexes.add(slice_)
+
+        # When finish, convert the set to a sorted tuple
+        indexes = tuple(sorted(list(indexes)))
+    else:  # If there aren't elements in the tuple
+        indexes = tuple(range(1, records + 1))
+
+    return indexes
+
+
+def notify(subject: str, message: str) -> None:
+
+    if not config.notify:
+        print("--- Notify disabled ---", f"subject: {subject}", f"message: {message}", sep="\n")
+        return
+
+    to_address: str = config.notify_to
+    password = config.notify_pass
+    server = smtplib.SMTP(config.notify_host)
+    from_address = config.notify_from
+    server.ehlo()
+    server.starttls()
+    server.login(from_address, password)
+
+    # Send the mail
+    body = "\r\n".join([
+        f"From: {from_address}",
+        f"To: {to_address}",
+        f"Subject: {subject}",
+        "",
+        str(message)
+    ])
+
+    server.sendmail(from_address, to_address, body)
+    server.quit()
+
+
+def logging_collector(type_: str, title: str, messages: List) -> None:
+    log_name = config.download_dir + f"log_{strftime('%y%m%d')}.txt"
+
+    with open(log_name, 'ab') as log:
+        timestamp = datetime.datetime.now().isoformat()
+        log.write(f"{timestamp}\t{type_}\t{title}".encode())
+        for message in messages:
+            log.write(f"\t{message}".encode())
+        log.write("\n".encode())
+
+
+
+if __name__ == "__main__":
+    # Start request ratio counting
+
+    proxies = [
+            '173.234.249.93:3128',
+			'104.140.164.140:3128',
+			'108.62.124.52:3128',
+			'108.62.124.232:3128',
+			'50.31.8.137:3128',
+			'108.62.124.205:3128',
+			'104.140.211.69:3128',
+			'104.140.211.142:3128',
+			'104.140.164.252:3128',
+			'104.140.211.11:3128',
+			'50.31.8.23:3128',
+			'50.31.8.148:3128',
+			'173.234.249.66:3128',
+			'173.234.249.20:3128',
+			'173.234.249.105:3128',
+			'108.62.124.148:3128',
+			'192.126.162.52:3128',
+			'192.126.162.144:3128',
+			'192.126.162.101:3128',
+			'50.31.8.30:3128',
+			'192.126.162.162:3128',
+			'104.140.164.231:3128',
+			'173.234.249.86:3128',
+			'104.140.164.61:3128',
+			'104.140.211.229:3128',
+
+			]
+    requestmeter.start()
+
+    userId = 1
+    researchId =1
+    n = 0
+
+    thread_limit = 50
+    sleet_for_limit = 40 * 60
+    try:
+        #Read proxy settings
+        proxy_list = []
+        proxi = {}
+        index = 0
+        #with open('Proxi-All.csv') as csvfile:
+        with open('no_auth_proxies.txt') as csvfile:
+            r = reader(csvfile, delimiter=',')
+
+            for row in r:
+                print("row===")
+                print(row)
+
+                # proxi['url'] = str(row[0])
+                # proxi['user'] = str(row[1])
+                # proxi['passwd'] = str(row[2])
+                proxy_list.append(str(row[0]))
+                index += 1
+
+        # print("proxies ========= ")
+        # print(proxy_list)
+        # Search keywords
+
+        index = 21570
+        scholar_info = xlrd.open_workbook('UNI-ID-Name-Site.xlsx')
+        worksheet = scholar_info.sheet_by_index(0)
+        while worksheet.cell(index, 3).value != xlrd.empty_cell.value:
+
+           if thread_count < thread_limit:
+               kw = str(worksheet.cell(index, 3).value)
+               if kw.split('.')[0] == "www" or kw.split('.')[0] == "http:www" or kw.split('.')[0] == "https:www":
+                   kw = kw.lstrip(kw.split('.')[0]+'.')
+               print(kw)
+
+               uni_id = str(worksheet.cell(index, 0).value)
+               uni_name = str(worksheet.cell(index, 1).value)
+               uni_url = str(worksheet.cell(index, 3).value)
+               photo_folder = str(worksheet.cell(index, 4).value)
+
+               # proxy_count = len(proxy_list)
+               # pn = (int(float(uni_id)) % proxy_count) + 1
+               #prox = random.choice(proxies)
+               prox = random.choice(proxy_list)
+               print("debug:proxy={0}".format(prox))
+               x = threading.Thread(target=download_users, args=(kw,uni_id,n, photo_folder, prox))
+               x.start()
+
+               # paramList = download_users(kw,uni_id,userId,n, photo_folder, prox)
+               # userId = paramList[0]
+               n=0
+
+               index+=1
+
+               thread_count += 1
+
+           sleep(1)
+           
+        #download_works(config.download_dir + "users_batch_181009_021134.csv", (21,40))
+        #notify("Batch finished", "The batch finished successfully!")
+    except Exception as e:
+        trace = traceback.format_exc()
+        print(trace)
+        notify("There was an error processing the batch", trace.encode('utf-8'))
+    finally:
+        requestmeter.finish()
+        requestmeter.summary()
